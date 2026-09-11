@@ -1,0 +1,50 @@
+name: Fantasy Football Alerts
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  repository_dispatch:
+    types: [run-alerts]
+  workflow_dispatch:
+
+concurrency:
+  group: ff-alerts
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Restore player DB cache
+        uses: actions/cache@v4
+        with:
+          path: players_cache.json
+          key: sleeper-players-${{ github.run_id }}
+          restore-keys: sleeper-players-
+      - name: Run monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          YCID: ${{ secrets.YCID }}
+          YSEC: ${{ secrets.YSEC }}
+          YTOK: ${{ secrets.YTOK }}
+        run: python monitor.py
+      - name: Persist state
+        run: |
+          git config user.name "ff-alerts-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "state [skip ci]"
+          git push
