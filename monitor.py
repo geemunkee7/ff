@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""monitor.py — fully automated breaking-news waiver alerts. No hard-coded names."""
+"""monitor.py — fully automated breaking-news waiver alerts, value-gated."""
 
 import hashlib
 import json
@@ -15,6 +15,7 @@ import requests
 
 import config
 import yahoo
+import value
 
 STATE_FILE = "state.json"
 PLAYERS_CACHE = "players_cache.json"
@@ -139,6 +140,44 @@ def fetch_trending(players_db):
     return out
 
 
+def current_week():
+    try:
+        resp = requests.get(config.SLEEPER_STATE_URL, headers=UA, timeout=HTTP_TIMEOUT)
+        wk = resp.json().get("week")
+        if isinstance(wk, int) and 1 <= wk <= 18:
+            return wk
+    except Exception as exc:
+        print(f"  ! state fetch failed: {exc}")
+    from datetime import date
+    start = date(2026, 9, 7)
+    wk = (now_local().date() - start).days // 7 + 1
+    return max(1, min(18, wk))
+
+
+def fetch_projections(week):
+    url = (f"{config.SLEEPER_PROJ_BASE}/{config.SEASON}/{week}"
+           "?season_type=regular"
+           "&position[]=QB&position[]=RB&position[]=WR"
+           "&position[]=TE&position[]=K&position[]=DEF")
+    out = {}
+    try:
+        resp = requests.get(url, headers=UA, timeout=HTTP_TIMEOUT)
+        rows = resp.json()
+    except Exception as exc:
+        print(f"  ! projections fetch failed: {exc}")
+        return out
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        pid = row.get("player_id")
+        stats = row.get("stats") or {}
+        pts = stats.get("pts_ppr")
+        if pid is not None and isinstance(pts, (int, float)):
+            out[str(pid)] = pts
+    print(f"  projections: {len(out)} players for week {week}")
+    return out
+
+
 def rank_of(rec):
     r = rec.get("search_rank")
     return r if isinstance(r, int) and r > 0 else UNRANKED
@@ -255,7 +294,19 @@ def available(name, taken):
     return norm(name) not in {norm(t) for t in taken}
 
 
-def build_alerts(items, trending, players_db, my_roster, taken, state):
+def _tier_near(raw_text, canonical_name, article_tier, article_trigger):
+    clauses = re.split(r"[;,.\u2014\-]| and | but ", raw_text)
+    target = norm(canonical_name)
+    for clause in clauses:
+        if name_in_text(target, re.sub(r"\s+", " ", norm(clause))):
+            t, kw = classify(clause)
+            if t:
+                return t, kw
+            return None, None
+    return article_tier, article_trigger
+
+
+def build_alerts(items, trending, players_db, my_roster, taken, state, val, week):
     alerts = []
     index = build_relevant_index(players_db, my_roster, taken)
     mine_n = {norm(n) for n in my_roster}
@@ -273,15 +324,19 @@ def build_alerts(items, trending, players_db, my_roster, taken, state):
         if not tier:
             continue
 
-        matched = [rec for n, rec in index.items() if name_in_text(n, blob)]
+        matched = [(n, rec) for n, rec in index.items() if name_in_text(n, blob)]
         if not matched:
             continue
         state["seen"].append(key)
 
-        prio = 1 if tier == "URGENT" else 0
-        for rec in matched:
+        for nkey, rec in matched:
             name = rec["full_name"]
             is_mine = norm(name) in mine_n
+            ptier, ptrig = _tier_near(text, name, tier, trigger)
+            if not ptier:
+                continue
+            tier, trigger = ptier, ptrig
+            prio = 1 if tier == "URGENT" else 0
 
             if is_mine:
                 if tier == "URGENT":
@@ -309,15 +364,22 @@ def build_alerts(items, trending, players_db, my_roster, taken, state):
                 alerts.append({"priority": prio, "title": f"[{tier}] HOLD: {nmu_name}",
                                "body": body, "link": item["link"]})
             elif norm(nmu_name) not in taken_cache:
+                ok, gtier, why = value.gate(nmu_name, my_roster, val, players_db, week, drop)
+                if not ok:
+                    continue
                 body = (f"{item['title']}\n\nCLAIM: {nmu_name} "
                         f"({nmu.get('position')}, {nmu.get('team')}) — next up behind "
-                        f"{name}.\n{drop_line}\n{item['source']}")
+                        f"{name}. [{gtier}: {why}]\n{drop_line}\n{item['source']}")
                 alerts.append({"priority": prio, "title": f"[{tier}] CLAIM {nmu_name}",
                                "body": body, "link": item["link"]})
 
+    trend_seen_run = set()
     for row in trending:
         if not row.get("name"):
             continue
+        if norm(row["name"]) in trend_seen_run:
+            continue
+        trend_seen_run.add(norm(row["name"]))
         if row["count"] < config.TRENDING_ADD_MIN or norm(row["name"]) in mine_n:
             continue
         if not available(row["name"], taken):
@@ -325,11 +387,15 @@ def build_alerts(items, trending, players_db, my_roster, taken, state):
         key = fingerprint(f"trend::{row['name']}::{now_local():%Y-%m-%d-%H}")
         if key in state["seen"]:
             continue
+        ok, gtier, why = value.gate(row["name"], my_roster, val, players_db, week, drop)
+        if not ok:
+            continue
         state["seen"].append(key)
         alerts.append({"priority": 0,
                        "title": f"[TRENDING] {row['name']} ({row['position']}, {row['team']})",
                        "body": (f"{row['count']:,} adds in {config.TRENDING_LOOKBACK_HOURS}h, "
-                                f"free in your league.\n{drop_line}"), "link": ""})
+                                f"free in your league. [{gtier}: {why}]\n{drop_line}"),
+                       "link": ""})
 
     for pid, p in players_db.items():
         name = p.get("full_name")
@@ -360,7 +426,10 @@ def build_alerts(items, trending, players_db, my_roster, taken, state):
             if norm(nn) in mine_n:
                 body = f"You roster {nn} — next up behind {name}. START/HOLD."
             elif norm(nn) not in taken_cache:
-                body = f"CLAIM {nn} — next up behind {name}. {drop_line}."
+                ok, gtier, why = value.gate(nn, my_roster, val, players_db, week, drop)
+                if not ok:
+                    continue
+                body = f"CLAIM {nn} — next up behind {name}. [{gtier}] {drop_line}."
             else:
                 continue
             alerts.append({"priority": prio, "title": f"[STATUS] {name}: {prev} -> {status}",
@@ -421,6 +490,9 @@ def main():
     players_db = load_player_db(state)
     items = fetch_rss()
     trending = fetch_trending(players_db)
+    week = current_week()
+    proj_map = fetch_projections(week)
+    val = value.build_valuation(players_db, proj_map)
     my_roster = yahoo.my_roster()
     taken = yahoo.taken_players()
     if not my_roster and taken:
@@ -430,7 +502,7 @@ def main():
     drop = recommend_drop(my_roster, players_db) if my_roster else None
     drop_line = f"DROP {drop}" if drop else "check your bench for a drop"
 
-    alerts = build_alerts(items, trending, players_db, my_roster, taken, state)
+    alerts = build_alerts(items, trending, players_db, my_roster, taken, state, val, week)
     alerts += waiver_reminder(state, drop_line)
 
     queued = state.get("queued", [])
